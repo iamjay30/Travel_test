@@ -178,12 +178,13 @@
      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
      crossorigin=""></script>
 
-    <script type="module">
+<script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, signInWithCustomToken, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        // 暫時保留 Firestore import，因為你的「讀取」與「刪除」功能還沒改寫成 API，避免報錯
         import { getFirestore, doc, setDoc, deleteDoc, onSnapshot, collection } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
-        // Firebase 初始化設定
+        // Firebase 初始化設定 (保留用於登入驗證)
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'travel-map-default';
         const firebaseConfigStr = typeof __firebase_config !== 'undefined' ? __firebase_config : '{}';
         let app, db, auth;
@@ -203,7 +204,6 @@
         let map;
         let markers = []; // 儲存所有標記的陣列
         let records = []; // 儲存旅遊紀錄資料的陣列
-        let isWaitingForLocation = false; // 是否正在等待使用者點擊地圖標記
 
         // DOM 元素
         const cityInput = document.getElementById('city-input');
@@ -226,6 +226,39 @@
         const logoutBtnMobile = document.getElementById('logout-btn-mobile');
         const userIdDisplay = document.getElementById('user-id-display');
 
+        // ==========================================
+        // 【步驟 1：新增統一的 API 儲存函式】
+        // ==========================================
+        async function saveRecordToServer(recordPayload) {
+            try {
+                const response = await fetch('/api/records', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(recordPayload)
+                });
+
+                const result = await response.json();
+
+                if (response.ok && result.success) {
+                    addMarkerToMap(result.data);
+                    records.push(result.data);
+                    updateRecordList();
+                    return true;
+                } else {
+                    console.error('儲存失敗:', result.error);
+                    showStatus('儲存失敗：' + (result.error || '未知錯誤'), 'error');
+                    return false;
+                }
+            } catch (error) {
+                console.error('網路請求發生錯誤:', error);
+                showStatus('無法連線到伺服器，請檢查網路狀態', 'error');
+                return false;
+            }
+        }
+
+        // --- 登入與登出邏輯 ---
         loginBtn.addEventListener('click', async () => {
             if (!auth) {
                 loginStatus.textContent = "無法連線至驗證伺服器";
@@ -262,13 +295,12 @@
                     loginStatus.textContent = "";
                     
                     if (!map) initMap();
-                    loadRecordsFromFirestore();
+                    loadRecordsFromFirestore(); // 暫時保留讀取 Firebase，未來需改寫
                 } else {
                     currentUser = null;
                     loginOverlay.style.display = 'flex';
                     userIdDisplay.textContent = '未登入';
                     
-                    // 清除本地資料與地圖標記
                     records = [];
                     markers.forEach(m => {
                         if (map) map.removeLayer(m);
@@ -283,28 +315,24 @@
                 }
             });
         } else {
-            // Fallback for local testing without Firebase env
             loginOverlay.style.display = 'none';
             initMap();
         }
 
         function initMap() {
-            // 設定初始中心點 (台灣) 和縮放級別
             map = L.map('map').setView([23.6978, 120.9605], 4);
-
-            // 加入 Google Maps 圖層以確保顯示繁體中文
             L.tileLayer('https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}&hl=zh-TW', {
                 maxZoom: 19,
                 attribution: '© Google'
             }).addTo(map);
 
-            // 監聽地圖點擊事件
             map.on('click', handleMapClick);
-
-            // 監聽新增按鈕點擊事件
             addRecordBtn.addEventListener('click', handleAddButtonClick);
         }
 
+        // ==========================================
+        // 【步驟 2：改寫 handleAddButtonClick (按鈕新增)】
+        // ==========================================
         async function handleAddButtonClick() {
             const cityName = cityInput.value.trim();
             const date = dateInput.value;
@@ -316,12 +344,10 @@
                 return;
             }
 
-            // 顯示載入中狀態
             addRecordBtn.disabled = true;
             addRecordBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i> 搜尋中...';
 
             try {
-                // 呼叫 Nominatim API 將城市名稱轉為經緯度 (Geocoding)
                 const response = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(cityName)}&accept-language=zh-TW&limit=1`);
                 const data = await response.json();
 
@@ -329,14 +355,14 @@
                     const lat = parseFloat(data[0].lat);
                     const lon = parseFloat(data[0].lon);
                     
-                    // 為了畫面美觀，取最前面的地名
                     let displayName = data[0].display_name.split(',')[0];
                     if (cityName.length < displayName.length) {
-                        displayName = cityName; // 如果使用者輸入的名字比較短，優先使用使用者的輸入
+                        displayName = cityName; 
                     }
 
-                    const newRecord = {
-                        id: Date.now().toString(),
+                    // 準備傳送給後端 Neon 資料庫的資料包
+                    const payload = {
+                        userId: currentUser ? currentUser.uid : 'guest_user',
                         city: displayName,
                         date: date || '未提供日期',
                         album: albumLink,
@@ -344,35 +370,29 @@
                         lng: lon
                     };
 
-                    if (currentUser && db) {
-                        const docRef = doc(db, 'artifacts', appId, 'users', currentUser.uid, 'travelRecords', newRecord.id);
-                        await setDoc(docRef, newRecord);
-                    } else {
-                        // Fallback
-                        addMarkerToMap(newRecord);
-                        records.push(newRecord);
-                        updateRecordList();
+                    const isSuccess = await saveRecordToServer(payload);
+
+                    if (isSuccess) {
+                        map.flyTo([lat, lon], 10);
+                        cityInput.value = '';
+                        dateInput.value = '';
+                        albumInput.value = '';
+                        showStatus('成功新增標記！', 'success');
                     }
-
-                    // 飛梭動畫移動至該點
-                    map.flyTo([lat, lon], 10);
-
-                    cityInput.value = '';
-                    dateInput.value = '';
-                    albumInput.value = '';
-                    showStatus('成功新增標記！', 'success');
                 } else {
                     showStatus('找不到該城市，請嘗試更詳細的地名或直接點擊地圖', 'error');
                 }
             } catch (error) {
                 showStatus('搜尋時發生錯誤，請稍後再試', 'error');
             } finally {
-                // 恢復按鈕狀態
                 addRecordBtn.disabled = false;
                 addRecordBtn.innerHTML = '<i class="fas fa-plus mr-1"></i> 新增標記';
             }
         }
 
+        // ==========================================
+        // 【步驟 3：改寫 handleMapClick (點擊地圖新增)】
+        // ==========================================
         async function handleMapClick(e) {
             const date = dateInput.value;
             const albumLink = albumInput.value.trim();
@@ -381,7 +401,6 @@
             showStatus('正在取得位置資訊...', 'success');
 
             try {
-                // 若使用者沒輸入城市，透過 API 反查點擊位置的地名 (Reverse Geocoding)
                 if (!cityName) {
                     const response = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${e.latlng.lat}&lon=${e.latlng.lng}&accept-language=zh-TW`);
                     const data = await response.json();
@@ -393,9 +412,9 @@
                     }
                 }
 
-                // 建立新紀錄物件
-                const newRecord = {
-                    id: Date.now().toString(),
+                // 準備傳送給後端 Neon 資料庫的資料包
+                const payload = {
+                    userId: currentUser ? currentUser.uid : 'guest_user',
                     city: cityName,
                     date: date || '未提供日期',
                     album: albumLink,
@@ -403,28 +422,21 @@
                     lng: e.latlng.lng
                 };
 
-                if (currentUser && db) {
-                    const docRef = doc(db, 'artifacts', appId, 'users', currentUser.uid, 'travelRecords', newRecord.id);
-                    await setDoc(docRef, newRecord);
-                } else {
-                    addMarkerToMap(newRecord);
-                    records.push(newRecord);
-                    updateRecordList();
-                }
+                const isSuccess = await saveRecordToServer(payload);
 
-                // 清空輸入框
-                cityInput.value = '';
-                dateInput.value = '';
-                albumInput.value = '';
-                
-                showStatus('成功新增標記！', 'success');
+                if (isSuccess) {
+                    cityInput.value = '';
+                    dateInput.value = '';
+                    albumInput.value = '';
+                    showStatus('成功新增標記！', 'success');
+                }
             } catch (error) {
                 showStatus('取得位置資訊失敗', 'error');
             }
         }
 
+        // --- 介面與地圖操作邏輯 ---
         function addMarkerToMap(record) {
-            // 自訂圖標 (可選，這裡使用預設但改顏色)
             const customIcon = L.icon({
                 iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-red.png',
                 shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/0.7.7/images/marker-shadow.png',
@@ -436,7 +448,6 @@
 
             const marker = L.marker([record.lat, record.lng], { icon: customIcon }).addTo(map);
             
-            // 建立 Popup 內容
             let popupContent = `
                 <div class="font-sans">
                     <h3 class="text-lg font-bold text-gray-800 mb-1">${record.city}</h3>
@@ -460,8 +471,6 @@
             `;
 
             marker.bindPopup(popupContent);
-            
-            // 將標記和 ID 關聯起來以便後續刪除
             marker.recordId = record.id;
             markers.push(marker);
         }
@@ -477,7 +486,6 @@
 
             emptyState.style.display = 'none';
 
-            // 依日期排序 (新的在前面)
             const sortedRecords = [...records].sort((a, b) => {
                 if(a.date === '未提供日期') return 1;
                 if(b.date === '未提供日期') return -1;
@@ -488,14 +496,11 @@
                 const item = document.createElement('div');
                 item.className = 'bg-white border border-gray-200 rounded-lg p-3 hover:shadow-md transition-shadow cursor-pointer flex justify-between items-center group';
                 
-                // 點擊列表項目移動地圖中心
                 item.onclick = () => {
                     map.flyTo([record.lat, record.lng], 8);
-                    // 找到對應的 marker 並開啟 popup
                     const marker = markers.find(m => m.recordId === record.id);
                     if(marker) marker.openPopup();
                     
-                    // 若在手機版，點擊後隱藏側邊欄
                     if(window.innerWidth <= 768) {
                         sidebar.classList.remove('active');
                     }
@@ -521,7 +526,6 @@
             });
         }
 
-        // 刪除紀錄
         window.deleteRecord = async function(id) {
             if (currentUser && db) {
                 const docRef = doc(db, 'artifacts', appId, 'users', currentUser.uid, 'travelRecords', id);
@@ -532,7 +536,6 @@
                     showStatus('刪除失敗', 'error');
                 }
             } else {
-                // Fallback local delete
                 const markerIndex = markers.findIndex(m => m.recordId === id);
                 if (markerIndex !== -1) {
                     map.removeLayer(markers[markerIndex]);
@@ -544,7 +547,6 @@
             }
         };
 
-        // 顯示狀態訊息
         function showStatus(message, type) {
             statusMessage.textContent = message;
             statusMessage.style.display = 'block';
@@ -555,7 +557,6 @@
                 statusMessage.className = 'text-sm font-medium text-green-600 mt-2 p-2 bg-green-50 rounded';
             }
 
-            // 3秒後隱藏
             setTimeout(() => {
                 statusMessage.style.display = 'none';
             }, 3000);
@@ -563,7 +564,6 @@
 
         function loadRecordsFromFirestore() {
             if (!currentUser || !db) return;
-            
             const collRef = collection(db, 'artifacts', appId, 'users', currentUser.uid, 'travelRecords');
             
             showStatus('同步資料中...', 'success');
@@ -592,7 +592,6 @@
             });
         }
 
-        // 手機版側邊欄切換
         toggleSidebarBtn.addEventListener('click', () => {
             sidebar.classList.toggle('active');
         });
